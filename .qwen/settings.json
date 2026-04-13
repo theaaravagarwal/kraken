@@ -10,7 +10,8 @@
       "Bash(/users/aa/repos/comp/comp *)",
       "Bash(./test_comp)",
       "Bash(int *)",
-      "Bash(rm *)"
+      "Bash(rm *)",
+      "Bash(chmod *)"
     ]
   },
   "$version": 3

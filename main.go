@@ -5,13 +5,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	configDir  = ".config/comp"
+	version    = "1.0.0"
+	configDir  = ".config/kraken"
 	configFile = "config.yaml"
 )
 
@@ -115,7 +117,7 @@ func configPath() (string, error) {
 	return filepath.Join(home, configDir, configFile), nil
 }
 
-// ensureConfigDir creates ~/.config/comp if it doesn't exist.
+// ensureConfigDir creates ~/.config/kraken if it doesn't exist.
 func ensureConfigDir() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -232,24 +234,34 @@ func buildCommand(profile *LanguageProfile, inputFile, outputFile string, extraA
 	return args
 }
 
+func printVersion() {
+	fmt.Printf("kraken v%s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+}
+
 func printUsage() {
-	fmt.Println(`comp — smart compilation wrapper
+	fmt.Println(`kraken — smart compilation wrapper
 
 USAGE:
-  comp <file> [extra flags...]    Compile and optionally run
-  comp --list                     Show available compilers
-  comp --init                     Generate default config
-  comp --run <file>               Compile and run immediately
-  comp --help                     Show this help
+  kraken <file> [extra flags...]    Compile and optionally run
+  kraken --list                     Show available compilers
+  kraken --init                     Generate default config
+  kraken --run <file>               Compile and run immediately
+  kraken --doctor                   Check environment health
+  kraken --version                  Show version
+  kraken --help                     Show this help
 
 EXAMPLES:
-  comp main.cpp                   Compile with configured flags
-  comp main.cpp --debug           Append --debug to the compile command
-  comp --run main.go              Build and run immediately
-  comp --list                     Check which compilers are available
+  kraken main.cpp                   Compile with configured flags
+  kraken main.cpp --debug           Append --debug to the compile command
+  kraken --run main.go              Build and run immediately
+  kraken --list                     Check which compilers are available
+  kraken --doctor                   Verify your setup is healthy
 
 CONFIG:
-  ~/.config/comp/config.yaml      Language profiles and settings`)
+  ~/.config/kraken/config.yaml      Language profiles and settings
+
+INSTALL:
+  go install github.com/theaaravagarwal/kraken@latest`)
 }
 
 func cmdList(cfg *Config) {
@@ -278,6 +290,90 @@ func cmdList(cfg *Config) {
 	fmt.Printf("Config: %s\n", cfgPath)
 }
 
+func cmdDoctor(cfg *Config) {
+	fmt.Println("kraken doctor — environment health check")
+	fmt.Println(strings.Repeat("=", 60))
+
+	allGood := true
+
+	// 1. Check compilers in PATH
+	fmt.Println("\n[Compilers in PATH]")
+	for lang, profile := range cfg.Languages {
+		path, err := findCompiler(profile.Compiler)
+		if err != nil {
+			fmt.Printf("  ✗ %-10s %s (not in PATH)\n", lang, profile.Compiler)
+			allGood = false
+		} else {
+			ver := getCompilerVersion(path)
+			fmt.Printf("  ✓ %-10s %s → %s\n", lang, profile.Compiler, ver)
+		}
+	}
+
+	// 2. Config health
+	fmt.Println("\n[Configuration]")
+	cfgPath, err := configPath()
+	if err != nil {
+		fmt.Printf("  ✗ Could not resolve config path: %v\n", err)
+		allGood = false
+	} else {
+		fmt.Printf("  Config path: %s\n", cfgPath)
+		_, err := os.Stat(cfgPath)
+		if os.IsNotExist(err) {
+			fmt.Printf("  ⚠ Config file does not exist (run `kraken --init` to create)\n")
+		} else if err != nil {
+			fmt.Printf("  ✗ Could not stat config file: %v\n", err)
+			allGood = false
+		} else {
+			// Validate YAML
+			data, readErr := os.ReadFile(cfgPath)
+			if readErr != nil {
+				fmt.Printf("  ✗ Could not read config file: %v\n", readErr)
+				allGood = false
+			} else {
+				var testCfg Config
+				if parseErr := yaml.Unmarshal(data, &testCfg); parseErr != nil {
+					fmt.Printf("  ✗ Config YAML is invalid: %v\n", parseErr)
+					allGood = false
+				} else {
+					fmt.Printf("  ✓ Config YAML is valid\n")
+				}
+			}
+		}
+	}
+
+	// 3. Permissions
+	fmt.Println("\n[Permissions]")
+	home, homeErr := os.UserHomeDir()
+	if homeErr != nil {
+		fmt.Printf("  ✗ Could not get home directory: %v\n", homeErr)
+		allGood = false
+	} else {
+		krakenDir := filepath.Join(home, configDir)
+		// Check if we can write to the directory (create if missing)
+		if err := os.MkdirAll(krakenDir, 0755); err != nil {
+			fmt.Printf("  ✗ Cannot create config directory %s: %v\n", krakenDir, err)
+			allGood = false
+		} else {
+			// Try writing a test file
+			testFile := filepath.Join(krakenDir, ".write_test")
+			if err := os.WriteFile(testFile, []byte(""), 0644); err != nil {
+				fmt.Printf("  ✗ Cannot write to %s: %v\n", krakenDir, err)
+				allGood = false
+			} else {
+				os.Remove(testFile)
+				fmt.Printf("  ✓ Can write to %s\n", krakenDir)
+			}
+		}
+	}
+
+	fmt.Println()
+	if allGood {
+		fmt.Println("All checks passed ✓")
+	} else {
+		fmt.Println("Some checks failed — review the output above")
+	}
+}
+
 func cmdCompile(cfg *Config, file string, extraArgs []string, runAfter bool) error {
 	// Resolve the file path
 	absFile, err := filepath.Abs(file)
@@ -298,7 +394,7 @@ func cmdCompile(cfg *Config, file string, extraArgs []string, runAfter bool) err
 	lang := lookupByExt(ext)
 	profile, ok := cfg.Languages[lang]
 	if !ok {
-		return fmt.Errorf("no language profile for extension '%s'\nAdd it to ~/.config/comp/config.yaml", lang)
+		return fmt.Errorf("no language profile for extension '%s'\nAdd it to ~/.config/kraken/config.yaml", lang)
 	}
 
 	// Check compiler exists
@@ -401,6 +497,9 @@ func main() {
 	case "--help", "-h":
 		printUsage()
 		os.Exit(0)
+	case "--version", "-v":
+		printVersion()
+		os.Exit(0)
 	case "--list", "-l":
 		cfg, err := loadConfig()
 		if err != nil {
@@ -431,6 +530,14 @@ func main() {
 		if err := cmdCompile(cfg, args[1], args[2:], true); err != nil {
 			os.Exit(1)
 		}
+		os.Exit(0)
+	case "--doctor":
+		cfg, err := loadConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		cmdDoctor(cfg)
 		os.Exit(0)
 	}
 
