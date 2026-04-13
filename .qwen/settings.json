@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go *)",
+      "Bash(./comp *)",
+      "Bash(cat)",
+      "Bash(return *)",
+      "Bash(})",
+      "Bash(eof)",
+      "Bash(/users/aa/repos/comp/comp *)",
+      "Bash(./test_comp)",
+      "Bash(int *)",
+      "Bash(rm *)"
+    ]
+  },
+  "$version": 3
+}
