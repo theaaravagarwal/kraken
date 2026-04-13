@@ -31,13 +31,8 @@ const (
 	depsFile   = "deps.json"
 )
 
-const (
-	colorGreen = "\033[32m"
-	colorRed   = "\033[31m"
-	colorReset = "\033[0m"
-)
-
 var includeRegex = regexp.MustCompile(`^\s*#include\s+"([^"]+)"`)
+var ui = newUITheme()
 
 // LanguageProfile defines how a language is compiled.
 type LanguageProfile struct {
@@ -54,10 +49,16 @@ type Options struct {
 	Verbose bool `yaml:"verbose,omitempty"`
 }
 
+type UIConfig struct {
+	Colors *bool  `yaml:"colors,omitempty"`
+	Theme  string `yaml:"theme,omitempty"`
+}
+
 // Config represents the full configuration.
 type Config struct {
 	Languages map[string]*LanguageProfile `yaml:"languages"`
 	Options   Options                     `yaml:"options"`
+	UI        UIConfig                    `yaml:"ui,omitempty"`
 }
 
 type Command interface {
@@ -98,6 +99,7 @@ type testResult struct {
 }
 
 func defaultConfig() *Config {
+	defaultColors := true
 	return &Config{
 		Languages: map[string]*LanguageProfile{
 			"c": {
@@ -154,6 +156,10 @@ func defaultConfig() *Config {
 		Options: Options{
 			AutoRun: false,
 			Verbose: true,
+		},
+		UI: UIConfig{
+			Colors: &defaultColors,
+			Theme:  "auto",
 		},
 	}
 }
@@ -218,6 +224,13 @@ func loadConfig() (*Config, error) {
 	return &cfg, nil
 }
 
+func applyUIFromConfig(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	ui.applyConfig(cfg.UI.Colors)
+}
+
 func saveDefaultConfig() error {
 	if err := ensureConfigDir(); err != nil {
 		return err
@@ -269,7 +282,50 @@ func saveDepCache(c *depCache) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".deps-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func acquireFileLock(path string, timeout time.Duration) (func(), error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+			_ = f.Close()
+			return func() { _ = os.Remove(path) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if info, statErr := os.Stat(path); statErr == nil {
+			if time.Since(info.ModTime()) > 30*time.Minute {
+				_ = os.Remove(path)
+				continue
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for lock: %s", path)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func findCompiler(name string) (string, error) {
@@ -324,27 +380,33 @@ func buildCommand(profile *LanguageProfile, inputFile, outputFile string, extraA
 }
 
 func printVersion() {
-	fmt.Printf("kraken v%s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+	fmt.Println(ui.title(fmt.Sprintf("kraken v%s (%s/%s)", version, runtime.GOOS, runtime.GOARCH)))
 }
 
 func printUsage() {
-	fmt.Println(`kraken — smart compilation wrapper
-
-USAGE:
-  kraken [--verbose] <file>         Compile and run (smart root mode)
-  kraken run [--temp] <file> [flags...]
-  kraken watch <file> [flags...]    Watch and rebuild on change
-  kraken test <file> [tests-dir]    Run parallel judge against *.in/*.out
-  kraken list                       Show available compilers
-  kraken init                       Generate default config
-  kraken doctor                     Check environment health
-  kraken version                    Show version
-  kraken help                       Show this help
-
-EXAMPLES:
-  kraken run --temp main.cpp
-  kraken watch main.cpp
-  kraken test solution.cpp tests`)
+	ui.printSessionHeader("help")
+	fmt.Println()
+	fmt.Println(ui.bold("Usage"))
+	fmt.Println("  kraken [--verbose] <file>")
+	fmt.Println("  kraken run [--temp] <file> [flags...]")
+	fmt.Println("  kraken watch <file> [flags...]")
+	fmt.Println("  kraken test <file> [tests-dir]")
+	fmt.Println("  kraken list | init | doctor | version | help")
+	fmt.Println()
+	fmt.Println(ui.bold("Commands"))
+	fmt.Printf("  %s  %s\n", ui.title("run"), "Compile and run a source file")
+	fmt.Printf("  %s %s\n", ui.title("watch"), "Watch and rebuild on changes")
+	fmt.Printf("  %s  %s\n", ui.title("test"), "Run parallel judge over *.in/*.out")
+	fmt.Printf("  %s  %s\n", ui.title("list"), "Show compiler availability")
+	fmt.Printf("  %s  %s\n", ui.title("init"), "Generate default config")
+	fmt.Printf("  %s %s\n", ui.title("doctor"), "Check environment health")
+	fmt.Printf("  %s %s\n", ui.title("version"), "Show version")
+	fmt.Printf("  %s  %s\n", ui.title("help"), "Show this help")
+	fmt.Println()
+	fmt.Println(ui.bold("Examples"))
+	fmt.Println("  kraken run --temp main.cpp")
+	fmt.Println("  kraken watch main.cpp")
+	fmt.Println("  kraken test solution.cpp tests")
 }
 
 func parseCompileInvocation(args []string) (string, []string, error) {
@@ -450,9 +512,14 @@ func shouldRebuild(absFile, output string, cache *depCache) (bool, error) {
 	if err != nil {
 		return true, nil
 	}
+	driftThreshold := time.Now().Add(2 * time.Second)
 	for _, dep := range deps {
 		st, err := os.Stat(dep)
 		if err != nil {
+			return true, nil
+		}
+		if st.ModTime().After(driftThreshold) {
+			fmt.Fprintf(os.Stderr, "%s\n", ui.warning(fmt.Sprintf("[WARN]: %s has a future timestamp. Clock drift detected; rebuilds may persist.", filepath.Base(dep))))
 			return true, nil
 		}
 		if st.ModTime().After(outMod) {
@@ -491,6 +558,14 @@ func resolveCompile(cfg *Config, file string, extraArgs []string, outputOverride
 		outputPath = filepath.Join(filepath.Dir(absFile), baseName+profile.OutputExt)
 	}
 
+	if outputPath != "" {
+		unlock, err := acquireFileLock(outputPath+".kraken.lock", 45*time.Second)
+		if err != nil {
+			return "", "", "", err
+		}
+		defer unlock()
+	}
+
 	if useDirtyCheck && isCCLike(lang) && outputPath != "" {
 		c, _ := loadDepCache()
 		if c != nil {
@@ -498,7 +573,7 @@ func resolveCompile(cfg *Config, file string, extraArgs []string, outputOverride
 			_ = saveDepCache(c)
 			if !dirty {
 				if cfg.Options.Verbose {
-					fmt.Println("[EXEC]: skipped compile (dependency graph unchanged)")
+					fmt.Println(ui.muted("[EXEC]: skipped compile (dependency graph unchanged)"))
 				}
 				return outputPath, absFile, lang, nil
 			}
@@ -507,8 +582,8 @@ func resolveCompile(cfg *Config, file string, extraArgs []string, outputOverride
 
 	cmdArgs := buildCommand(profile, absFile, outputPath, extraArgs)
 	if cfg.Options.Verbose {
-		fmt.Printf("[EXEC]: %s %s\n", profile.Compiler, strings.Join(cmdArgs, " "))
-		fmt.Println(strings.Repeat("─", 60))
+		fmt.Println(ui.muted(fmt.Sprintf("[EXEC]: %s %s", profile.Compiler, strings.Join(cmdArgs, " "))))
+		fmt.Println(ui.muted(strings.Repeat("─", 60)))
 	}
 
 	cmd := exec.Command(compilerPath, cmdArgs...)
@@ -519,7 +594,7 @@ func resolveCompile(cfg *Config, file string, extraArgs []string, outputOverride
 		return "", "", "", err
 	}
 	if cfg.Options.Verbose {
-		fmt.Println("compilation successful ✓")
+		fmt.Println(ui.success("compilation successful"))
 	}
 	return outputPath, absFile, lang, nil
 }
@@ -551,7 +626,7 @@ func runBinary(lang, absFile, runPath string, workDir string) error {
 			return fmt.Errorf("java runtime not found")
 		}
 		base := strings.TrimSuffix(filepath.Base(absFile), filepath.Ext(absFile))
-		fmt.Printf("running: java %s\n", base)
+		fmt.Println(ui.title(fmt.Sprintf("running: java %s", base)))
 		cmd := exec.Command(javaPath, "-cp", filepath.Dir(absFile), base)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -559,11 +634,10 @@ func runBinary(lang, absFile, runPath string, workDir string) error {
 		if workDir != "" {
 			cmd.Dir = workDir
 		}
-		setPGID(cmd)
-		return runWithSignalCleanup(cmd)
+		return runWithSignalCleanup(cmd, false)
 	}
 
-	fmt.Printf("running: %s\n", runPath)
+	fmt.Println(ui.title(fmt.Sprintf("running: %s", runPath)))
 	cmd := exec.Command(runPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -571,11 +645,10 @@ func runBinary(lang, absFile, runPath string, workDir string) error {
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
-	setPGID(cmd)
-	return runWithSignalCleanup(cmd)
+	return runWithSignalCleanup(cmd, false)
 }
 
-func runWithSignalCleanup(cmd *exec.Cmd) error {
+func runWithSignalCleanup(cmd *exec.Cmd, useProcessGroup bool) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -592,9 +665,22 @@ func runWithSignalCleanup(cmd *exec.Cmd) error {
 	case err := <-done:
 		return err
 	case <-sigCh:
-		_ = killProcessGroup(cmd.Process.Pid)
-		<-done
-		return errors.New("interrupted")
+		if useProcessGroup {
+			_ = killProcessGroup(cmd.Process.Pid)
+		} else if cmd.Process != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+		}
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+			if useProcessGroup {
+				_ = killProcessGroup(cmd.Process.Pid)
+			} else if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-done
+		}
+		return nil
 	}
 }
 
@@ -602,7 +688,7 @@ func cmdCompile(cfg *Config, file string, extraArgs []string, runAfter bool) err
 	runPath, absFile, lang, err := resolveCompile(cfg, file, extraArgs, "", true)
 	if err != nil {
 		if cfg.Options.Verbose {
-			fmt.Printf("\ncompilation failed (exit code: %v)\n", err)
+			fmt.Printf("\n%s\n", ui.failure(fmt.Sprintf("compilation failed (exit code: %v)", err)))
 		}
 		return err
 	}
@@ -645,6 +731,7 @@ func handleCompileCommand(args []string, runAfter bool, verboseOverride *bool) e
 	if err != nil {
 		return fmt.Errorf("error loading config: %w", err)
 	}
+	applyUIFromConfig(cfg)
 	if verboseOverride != nil {
 		cfg.Options.Verbose = *verboseOverride
 	}
@@ -662,6 +749,7 @@ func handleRun(args []string, verboseOverride *bool) error {
 		filtered = append(filtered, a)
 	}
 	if !temp {
+		ui.printSessionHeader("run")
 		return handleCompileCommand(filtered, true, verboseOverride)
 	}
 
@@ -673,9 +761,11 @@ func handleRun(args []string, verboseOverride *bool) error {
 	if err != nil {
 		return err
 	}
+	applyUIFromConfig(cfg)
 	if verboseOverride != nil {
 		cfg.Options.Verbose = *verboseOverride
 	}
+	ui.printSessionHeader("run --temp")
 	tempDir, err := os.MkdirTemp("", "kraken-*")
 	if err != nil {
 		return err
@@ -689,12 +779,15 @@ func handleRun(args []string, verboseOverride *bool) error {
 		return err
 	}
 	if cfg.Options.Verbose {
-		fmt.Printf("[temp] %s\n", tempDir)
+		fmt.Println(ui.muted(fmt.Sprintf("[temp] %s", tempDir)))
 	}
 	return runBinary(lang, absFile, runPath, filepath.Dir(absFile))
 }
 
 func clearScreen() {
+	if !ui.enabled {
+		return
+	}
 	fmt.Print("\033[2J\033[H")
 }
 
@@ -707,6 +800,7 @@ func handleWatch(args []string, verboseOverride *bool) error {
 	if err != nil {
 		return err
 	}
+	applyUIFromConfig(cfg)
 	if verboseOverride != nil {
 		cfg.Options.Verbose = *verboseOverride
 	}
@@ -735,19 +829,19 @@ func handleWatch(args []string, verboseOverride *bool) error {
 
 	rebuild := func(reason string) {
 		clearScreen()
-		fmt.Printf("kraken watch — %s (%s)\n", file, reason)
-		fmt.Println(strings.Repeat("=", 60))
+		ui.printSessionHeader(fmt.Sprintf("watch | %s (%s)", file, reason))
+		fmt.Println(ui.muted(strings.Repeat("=", 60)))
 		killRunning()
 
 		runPath, abs, lang, buildErr := resolveCompile(cfg, file, extraArgs, "", true)
 		if buildErr != nil {
-			fmt.Printf("build failed: %v\n", buildErr)
+			fmt.Println(ui.failure(fmt.Sprintf("build failed: %v", buildErr)))
 			return
 		}
 		if lang == "java" {
 			javaPath, err := findCompiler("java")
 			if err != nil {
-				fmt.Printf("run failed: %v\n", err)
+				fmt.Println(ui.failure(fmt.Sprintf("run failed: %v", err)))
 				return
 			}
 			base := strings.TrimSuffix(filepath.Base(abs), filepath.Ext(abs))
@@ -759,13 +853,15 @@ func handleWatch(args []string, verboseOverride *bool) error {
 		running.Stdout = os.Stdout
 		running.Stderr = os.Stderr
 		running.Stdin = os.Stdin
+		// Watch mode acts as a process supervisor; keep child in its own group so
+		// file-change restarts can terminate the full process tree.
 		setPGID(running)
 		if err := running.Start(); err != nil {
-			fmt.Printf("run failed: %v\n", err)
+			fmt.Println(ui.failure(fmt.Sprintf("run failed: %v", err)))
 			running = nil
 			return
 		}
-		fmt.Printf("running pid=%d\n", running.Process.Pid)
+		fmt.Println(ui.muted(fmt.Sprintf("running pid=%d", running.Process.Pid)))
 	}
 
 	timer := time.NewTimer(time.Hour)
@@ -794,7 +890,7 @@ func handleWatch(args []string, verboseOverride *bool) error {
 			}
 			timer.Reset(100 * time.Millisecond)
 		case err := <-watcher.Errors:
-			fmt.Printf("watch error: %v\n", err)
+			fmt.Println(ui.failure(fmt.Sprintf("watch error: %v", err)))
 		case <-timer.C:
 			if pending {
 				pending = false
@@ -931,11 +1027,13 @@ func handleTest(args []string, verboseOverride *bool) error {
 	if err != nil {
 		return err
 	}
+	applyUIFromConfig(cfg)
 	if verboseOverride != nil {
 		cfg.Options.Verbose = *verboseOverride
 	}
+	ui.printSessionHeader("test")
 	if cfg.Options.Verbose {
-		fmt.Println("[normalize]: CRLF->LF, trim trailing whitespace, trim trailing empty lines")
+		fmt.Println(ui.muted("[normalize]: CRLF->LF, trim trailing whitespace, trim trailing empty lines"))
 	}
 
 	tempDir, err := os.MkdirTemp("", "kraken-test-*")
@@ -994,29 +1092,49 @@ func handleTest(args []string, verboseOverride *bool) error {
 	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
 
 	failed := 0
+	totalDuration := time.Duration(0)
 	for _, r := range all {
+		totalDuration += r.Duration
+		testLabel := fmt.Sprintf("[%s]", r.Name)
+		pathLabel := fmt.Sprintf("(%s)", r.InputPath)
 		if r.Pass {
-			fmt.Printf("%s[PASS]%s %s (%s)\n", colorGreen, colorReset, r.Name, r.Duration.Round(time.Millisecond))
+			fmt.Printf("%s  %-6s %6s  %s\n", ui.success("PASS"), testLabel, r.Duration.Round(time.Millisecond), pathLabel)
 			continue
 		}
 		failed++
-		fmt.Printf("%s[FAIL]%s %s (%s)\n", colorRed, colorReset, r.Name, r.Duration.Round(time.Millisecond))
-		if r.TimedOut {
-			fmt.Println("  reason: timeout")
-		}
-		if r.RunErr != nil && !r.TimedOut {
-			fmt.Printf("  reason: %v\n", r.RunErr)
-		}
-		if r.Stderr != "" {
-			fmt.Printf("  stderr:\n%s\n", indent(r.Stderr, "    "))
-		}
-		fmt.Println(indent(sideBySideDiff(r.Expected, r.Actual), "  "))
+		fmt.Printf("%s  %-6s %6s  %s -> %s\n", ui.failure("FAIL"), testLabel, r.Duration.Round(time.Millisecond), pathLabel, summarizeFailure(r))
 	}
-	fmt.Printf("\nsummary: %d/%d passed\n", len(all)-failed, len(all))
+	fmt.Println(ui.muted(strings.Repeat("-", 31)))
+	summary := fmt.Sprintf("RESULTS: %d/%d Passed (Total: %s)", len(all)-failed, len(all), totalDuration.Round(time.Millisecond))
+	if failed == 0 {
+		fmt.Println(ui.success(summary))
+	} else {
+		fmt.Println(ui.failure(summary))
+	}
 	if failed > 0 {
 		return fmt.Errorf("%d test(s) failed", failed)
 	}
 	return nil
+}
+
+func summarizeFailure(r testResult) string {
+	if r.TimedOut {
+		return "timeout"
+	}
+	if r.RunErr != nil {
+		return r.RunErr.Error()
+	}
+	exp := firstLine(r.Expected)
+	act := firstLine(r.Actual)
+	return fmt.Sprintf("Expected %q, got %q", exp, act)
+}
+
+func firstLine(s string) string {
+	if s == "" {
+		return ""
+	}
+	parts := strings.SplitN(s, "\n", 2)
+	return parts[0]
 }
 
 func indent(s, prefix string) string {
@@ -1032,26 +1150,27 @@ func handleList(verboseOverride *bool) error {
 	if err != nil {
 		return err
 	}
+	applyUIFromConfig(cfg)
 	if verboseOverride != nil {
 		cfg.Options.Verbose = *verboseOverride
 	}
-	fmt.Println("Compiler availability:")
-	fmt.Println(strings.Repeat("─", 60))
+	ui.printSessionHeader("list")
+	fmt.Println(ui.muted(strings.Repeat("─", 60)))
 	for lang, profile := range cfg.Languages {
 		path, err := findCompiler(profile.Compiler)
-		status := "✗ Missing"
+		status := ui.failure("missing")
 		version := "— not found"
 		if err == nil {
-			status = "✓ Available"
+			status = ui.success("available")
 			version = getCompilerVersion(path)
 		}
-		fmt.Printf("  %-10s %-12s %s\n", lang, status, profile.Compiler)
+		fmt.Printf("  %-10s %-12s %s\n", lang, status, ui.title(profile.Compiler))
 		if cfg.Options.Verbose && err == nil {
-			fmt.Printf("             → %s\n", version)
+			fmt.Printf("             %s %s\n", ui.muted("->"), ui.muted(version))
 		}
 	}
 	cfgPath, _ := configPath()
-	fmt.Printf("\nConfig: %s\n", cfgPath)
+	fmt.Printf("\n%s %s\n", ui.bold("Config:"), cfgPath)
 	return nil
 }
 
@@ -1060,48 +1179,49 @@ func handleDoctor(verboseOverride *bool) error {
 	if err != nil {
 		return err
 	}
+	applyUIFromConfig(cfg)
 	if verboseOverride != nil {
 		cfg.Options.Verbose = *verboseOverride
 	}
 
-	fmt.Println("kraken doctor — environment health check")
-	fmt.Println(strings.Repeat("=", 60))
+	ui.printSessionHeader("doctor")
+	fmt.Println(ui.muted(strings.Repeat("=", 60)))
 	allGood := true
 
-	fmt.Println("\n[Compilers in PATH]")
+	fmt.Println("\n" + ui.bold("[Compilers in PATH]"))
 	for lang, profile := range cfg.Languages {
 		path, err := findCompiler(profile.Compiler)
 		if err != nil {
-			fmt.Printf("  ✗ %-10s %s (not in PATH)\n", lang, profile.Compiler)
+			fmt.Printf("  %s %-10s %s (not in PATH)\n", ui.failure("x"), lang, profile.Compiler)
 			allGood = false
 		} else {
-			fmt.Printf("  ✓ %-10s %s → %s\n", lang, profile.Compiler, getCompilerVersion(path))
+			fmt.Printf("  %s %-10s %s -> %s\n", ui.success("ok"), lang, profile.Compiler, ui.muted(getCompilerVersion(path)))
 		}
 	}
 
-	fmt.Println("\n[Required Toolchains]")
+	fmt.Println("\n" + ui.bold("[Required Toolchains]"))
 	for _, tool := range []string{"g++", "clang", "go"} {
 		if _, err := exec.LookPath(tool); err != nil {
-			fmt.Printf("  ✗ %s not found\n", tool)
+			fmt.Printf("  %s %s not found\n", ui.failure("x"), tool)
 			allGood = false
 		} else {
-			fmt.Printf("  ✓ %s found\n", tool)
+			fmt.Printf("  %s %s found\n", ui.success("ok"), tool)
 		}
 	}
 
-	fmt.Println("\n[Configuration]")
+	fmt.Println("\n" + ui.bold("[Configuration]"))
 	cfgPath, err := configPath()
 	if err != nil {
-		fmt.Printf("  ✗ Could not resolve config path: %v\n", err)
+		fmt.Printf("  %s Could not resolve config path: %v\n", ui.failure("x"), err)
 		allGood = false
 	} else {
 		fmt.Printf("  Config path: %s\n", cfgPath)
 		data, readErr := os.ReadFile(cfgPath)
 		if readErr != nil {
 			if os.IsNotExist(readErr) {
-				fmt.Println("  ⚠ Config file does not exist (run `kraken init`)")
+				fmt.Println("  " + ui.warning("! Config file does not exist (run `kraken init`)"))
 			} else {
-				fmt.Printf("  ✗ Could not read config file: %v\n", readErr)
+				fmt.Printf("  %s Could not read config file: %v\n", ui.failure("x"), readErr)
 				allGood = false
 			}
 		} else {
@@ -1109,19 +1229,19 @@ func handleDoctor(verboseOverride *bool) error {
 			dec := yaml.NewDecoder(bytes.NewReader(data))
 			dec.KnownFields(true)
 			if parseErr := dec.Decode(&testCfg); parseErr != nil {
-				fmt.Printf("  ✗ Config YAML is invalid: %v\n", parseErr)
+				fmt.Printf("  %s Config YAML is invalid: %v\n", ui.failure("x"), parseErr)
 				allGood = false
 			} else {
-				fmt.Printf("  ✓ Config YAML is valid\n")
+				fmt.Printf("  %s Config YAML is valid\n", ui.success("ok"))
 			}
 		}
 	}
 
 	fmt.Println()
 	if allGood {
-		fmt.Println("All checks passed ✓")
+		fmt.Println(ui.success("All checks passed"))
 	} else {
-		fmt.Println("Some checks failed — review the output above")
+		fmt.Println(ui.failure("Some checks failed; review the output above"))
 	}
 	return nil
 }
@@ -1131,7 +1251,8 @@ func handleInit() error {
 		return err
 	}
 	cfgPath, _ := configPath()
-	fmt.Printf("Default config created at: %s\n", cfgPath)
+	ui.printSessionHeader("init")
+	fmt.Printf("%s %s\n", ui.success("Default config created at:"), cfgPath)
 	return nil
 }
 
@@ -1183,7 +1304,7 @@ func main() {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s\n", ui.failure(fmt.Sprintf("Error: %v", err)))
 		os.Exit(1)
 	}
 }
