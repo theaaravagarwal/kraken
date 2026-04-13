@@ -180,6 +180,16 @@ func findCompiler(name string) (string, error) {
 
 // getCompilerVersion tries to get a version string from the compiler.
 func getCompilerVersion(path string) string {
+	// Go uses "go version" instead of "go --version"
+	if strings.HasSuffix(path, "go") || strings.HasSuffix(path, "go.exe") {
+		cmd := exec.Command(path, "version")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return "unknown"
+		}
+		return strings.TrimSpace(string(out))
+	}
+
 	cmd := exec.Command(path, "--version")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
