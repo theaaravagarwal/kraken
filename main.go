@@ -32,17 +32,7 @@ const (
 )
 
 var includeRegex = regexp.MustCompile(`^\s*#include\s+"([^"]+)"`)
-var ui = func() uiTheme {
-	t := newUITheme()
-	t.asciiArt = `
-  ___  ___ 
- / _ \/ _ \
-| | | | | |
-| |_| | |_|
- \___/ \___/
-`
-	return t
-}()
+var ui = newUITheme()
 
 // LanguageProfile defines how a language is compiled.
 type LanguageProfile struct {
@@ -60,8 +50,9 @@ type Options struct {
 }
 
 type UIConfig struct {
-	Colors *bool  `yaml:"colors,omitempty"`
-	Theme  string `yaml:"theme,omitempty"`
+	Colors      *bool  `yaml:"colors,omitempty"`
+	Theme       string `yaml:"theme,omitempty"`
+	BannerFont  string `yaml:"banner_font,omitempty"`
 }
 
 // Config represents the full configuration.
@@ -238,7 +229,7 @@ func applyUIFromConfig(cfg *Config) {
 	if cfg == nil {
 		return
 	}
-	ui.applyConfig(cfg.UI.Colors)
+	ui.applyConfig(cfg.UI.Colors, cfg.UI.BannerFont)
 }
 
 func saveDefaultConfig() error {
@@ -1272,9 +1263,24 @@ func handleInit() error {
 
 func commandRegistry(verboseOverride *bool) map[string]Command {
 	return map[string]Command{
-		"help":      commandFunc(func(args []string) error { printUsage(); return nil }),
-		"--help":    commandFunc(func(args []string) error { printUsage(); return nil }),
-		"-h":        commandFunc(func(args []string) error { printUsage(); return nil }),
+		"help": commandFunc(func(args []string) error {
+			cfg, _ := loadConfig()
+			applyUIFromConfig(cfg)
+			printUsage()
+			return nil
+		}),
+		"--help": commandFunc(func(args []string) error {
+			cfg, _ := loadConfig()
+			applyUIFromConfig(cfg)
+			printUsage()
+			return nil
+		}),
+		"-h": commandFunc(func(args []string) error {
+			cfg, _ := loadConfig()
+			applyUIFromConfig(cfg)
+			printUsage()
+			return nil
+		}),
 		"version":   commandFunc(func(args []string) error { printVersion(); return nil }),
 		"--version": commandFunc(func(args []string) error { printVersion(); return nil }),
 		"-v":        commandFunc(func(args []string) error { printVersion(); return nil }),

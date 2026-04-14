@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
 )
 
 type uiTheme struct {
@@ -66,13 +69,35 @@ func (u uiTheme) printSessionHeader(section string) {
 		fmt.Println(u.title(u.asciiArt))
 		fmt.Println()
 	}
-	fmt.Println(u.title("kraken | " + section))
+	fmt.Println(u.title(section))
 }
 
-func (u *uiTheme) applyConfig(colors *bool) {
+func (u *uiTheme) applyConfig(colors *bool, bannerFont string) {
 	if colors == nil {
 		u.enabled = u.baseEnabled
-		return
+	} else {
+		u.enabled = u.baseEnabled && *colors
 	}
-	u.enabled = u.baseEnabled && *colors
+
+	if bannerFont != "" {
+		u.asciiArt = generateFigletBanner(bannerFont)
+	}
+}
+
+func generateFigletBanner(font string) string {
+	cmd := exec.Command("figlet", "-f", font, "kraken")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		// figlet not installed or font not found — return empty
+		return ""
+	}
+
+	result := strings.TrimSpace(stdout.String())
+	if result == "" {
+		return ""
+	}
+	return result
 }
