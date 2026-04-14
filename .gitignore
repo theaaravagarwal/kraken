@@ -1,0 +1,34 @@
+# Build output
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.tar.gz
+
+# Binaries
+kraken
+kraken_*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Qwen
+.qwen/
+
+# Go
+*.test
+*.prof
+coverage.out
+
+# Config (keep local configs out of git)
+config.yaml

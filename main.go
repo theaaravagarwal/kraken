@@ -32,7 +32,17 @@ const (
 )
 
 var includeRegex = regexp.MustCompile(`^\s*#include\s+"([^"]+)"`)
-var ui = newUITheme()
+var ui = func() uiTheme {
+	t := newUITheme()
+	t.asciiArt = `
+  ___  ___ 
+ / _ \/ _ \
+| | | | | |
+| |_| | |_|
+ \___/ \___/
+`
+	return t
+}()
 
 // LanguageProfile defines how a language is compiled.
 type LanguageProfile struct {
@@ -600,8 +610,8 @@ func resolveCompile(cfg *Config, file string, extraArgs []string, outputOverride
 }
 
 func setPGID(cmd *exec.Cmd) {
-	if runtime.GOOS != "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if !isWindows() {
+		setPGIDUnix(cmd)
 	}
 }
 
@@ -609,14 +619,18 @@ func killProcessGroup(pid int) error {
 	if pid <= 0 {
 		return nil
 	}
-	if runtime.GOOS == "windows" {
+	if isWindows() {
 		p, err := os.FindProcess(pid)
 		if err != nil {
 			return err
 		}
 		return p.Kill()
 	}
-	return syscall.Kill(-pid, syscall.SIGKILL)
+	return killUnix(-pid)
+}
+
+func isWindows() bool {
+	return runtime.GOOS == "windows"
 }
 
 func runBinary(lang, absFile, runPath string, workDir string) error {

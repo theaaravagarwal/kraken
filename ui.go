@@ -8,6 +8,7 @@ import (
 type uiTheme struct {
 	baseEnabled bool
 	enabled     bool
+	asciiArt    string
 }
 
 func newUITheme() uiTheme {
@@ -61,8 +62,10 @@ func (u uiTheme) bold(s string) string {
 }
 
 func (u uiTheme) printSessionHeader(section string) {
-	// ASCII banner placeholder:
-	// add your octopus art here if desired and print it before the title line.
+	if u.asciiArt != "" {
+		fmt.Println(u.title(u.asciiArt))
+		fmt.Println()
+	}
 	fmt.Println(u.title("kraken | " + section))
 }
 

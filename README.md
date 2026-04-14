@@ -50,7 +50,7 @@ git tag v1.0.0
 git push origin v1.0.0
 
 # Build all platform binaries
-./release.sh
+./build.sh
 
 # Upload the tar.gz files from dist/ to GitHub Releases:
 # https://github.com/theaaravagarwal/kraken/releases/new
