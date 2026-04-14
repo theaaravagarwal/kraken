@@ -50,9 +50,20 @@ type Options struct {
 }
 
 type UIConfig struct {
-	Colors      *bool  `yaml:"colors,omitempty"`
-	Theme       string `yaml:"theme,omitempty"`
-	BannerFont  string `yaml:"banner_font,omitempty"`
+	// Enable/disable colored output (true/false). Auto-detected based on TTY if nil.
+	Colors *bool `yaml:"colors,omitempty"`
+	// Theme for UI presentation (auto, minimal, etc.)
+	Theme string `yaml:"theme,omitempty"`
+	// Figlet font for the banner (if figlet is installed). Leave empty to use default ASCII art.
+	// Example: "big", "small", "banner"
+	BannerFont string `yaml:"banner_font,omitempty"`
+	// Randomize the color palette on each run (true/false). Requires colors enabled.
+	// Available palettes: ocean, fire, forest, twilight, sunset, arctic, neon, vintage
+	RandomizeColors *bool `yaml:"randomize_colors,omitempty"`
+	// Specific color palette to use (ocean, fire, forest, twilight, sunset, arctic, neon, vintage)
+	// If empty and randomize_colors is true, a random palette is selected each run.
+	// If empty and randomize_colors is false, defaults to "ocean".
+	ColorPalette string `yaml:"color_palette,omitempty"`
 }
 
 // Config represents the full configuration.
@@ -101,6 +112,7 @@ type testResult struct {
 
 func defaultConfig() *Config {
 	defaultColors := true
+	defaultRandomize := false
 	return &Config{
 		Languages: map[string]*LanguageProfile{
 			"c": {
@@ -159,8 +171,11 @@ func defaultConfig() *Config {
 			Verbose: true,
 		},
 		UI: UIConfig{
-			Colors: &defaultColors,
-			Theme:  "auto",
+			Colors:          &defaultColors,
+			Theme:           "auto",
+			BannerFont:      "", // Leave empty for default ASCII art, or try "big", "small", "banner" with figlet
+			RandomizeColors: &defaultRandomize,
+			ColorPalette:    "ocean", // Options: ocean, fire, forest, twilight, sunset, arctic, neon, vintage
 		},
 	}
 }
@@ -229,7 +244,7 @@ func applyUIFromConfig(cfg *Config) {
 	if cfg == nil {
 		return
 	}
-	ui.applyConfig(cfg.UI.Colors, cfg.UI.BannerFont)
+	ui.applyConfig(cfg.UI.Colors, cfg.UI.BannerFont, cfg.UI.RandomizeColors, cfg.UI.ColorPalette)
 }
 
 func saveDefaultConfig() error {
@@ -392,7 +407,7 @@ func printUsage() {
 	fmt.Println("  kraken run [--temp] <file> [flags...]")
 	fmt.Println("  kraken watch <file> [flags...]")
 	fmt.Println("  kraken test <file> [tests-dir]")
-	fmt.Println("  kraken list | init | doctor | version | help")
+	fmt.Println("  kraken list | init | doctor | themes | version | help")
 	fmt.Println()
 	fmt.Println(ui.bold("Commands"))
 	fmt.Printf("  %s  %s\n", ui.title("run"), "Compile and run a source file")
@@ -401,6 +416,7 @@ func printUsage() {
 	fmt.Printf("  %s  %s\n", ui.title("list"), "Show compiler availability")
 	fmt.Printf("  %s  %s\n", ui.title("init"), "Generate default config")
 	fmt.Printf("  %s %s\n", ui.title("doctor"), "Check environment health")
+	fmt.Printf("  %s %s\n", ui.title("themes"), "Show available color themes")
 	fmt.Printf("  %s %s\n", ui.title("version"), "Show version")
 	fmt.Printf("  %s  %s\n", ui.title("help"), "Show this help")
 	fmt.Println()
@@ -408,6 +424,7 @@ func printUsage() {
 	fmt.Println("  kraken run --temp main.cpp")
 	fmt.Println("  kraken watch main.cpp")
 	fmt.Println("  kraken test solution.cpp tests")
+	fmt.Println("  kraken themes")
 }
 
 func parseCompileInvocation(args []string) (string, []string, error) {
@@ -1261,6 +1278,47 @@ func handleInit() error {
 	return nil
 }
 
+func handleThemes(verboseOverride *bool) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	applyUIFromConfig(cfg)
+	if verboseOverride != nil {
+		cfg.Options.Verbose = *verboseOverride
+	}
+
+	ui.printSessionHeader("themes")
+	fmt.Println(ui.muted("Available color palettes (set in config.yaml ui.color_palette):"))
+	fmt.Println()
+
+	paletteNames := getPaletteNames()
+	for _, name := range paletteNames {
+		palette := ColorPalettes[name]
+		// Display the palette name in its own color
+		header := fmt.Sprintf("  %s", name)
+		fmt.Println(ui.wrap(palette.Logo, header))
+
+		if cfg.Options.Verbose {
+			// Show sample colors from this palette
+			fmt.Printf("    %s", ui.wrap(palette.Title, "title"))
+			fmt.Printf(" | %s", ui.wrap(palette.Success, "success"))
+			fmt.Printf(" | %s", ui.wrap(palette.Failure, "failure"))
+			fmt.Printf(" | %s\n", ui.wrap(palette.Warning, "warning"))
+		}
+	}
+
+	fmt.Println()
+	fmt.Println(ui.muted("Configuration example (in ~/.config/kraken/config.yaml under ui section):"))
+	fmt.Println()
+	fmt.Println(ui.muted("  color_palette: ocean          # Use specific palette"))
+	fmt.Println(ui.muted("  randomize_colors: true        # Randomize on each run"))
+	fmt.Println(ui.muted("  colors: true                  # Enable/disable colors"))
+	fmt.Println(ui.muted("  banner_font: big              # Use figlet font (if installed)"))
+	fmt.Println()
+	return nil
+}
+
 func commandRegistry(verboseOverride *bool) map[string]Command {
 	return map[string]Command{
 		"help": commandFunc(func(args []string) error {
@@ -1296,6 +1354,8 @@ func commandRegistry(verboseOverride *bool) map[string]Command {
 		"list":      commandFunc(func(args []string) error { return handleList(verboseOverride) }),
 		"--list":    commandFunc(func(args []string) error { return handleList(verboseOverride) }),
 		"-l":        commandFunc(func(args []string) error { return handleList(verboseOverride) }),
+		"themes":    commandFunc(func(args []string) error { return handleThemes(verboseOverride) }),
+		"--themes":  commandFunc(func(args []string) error { return handleThemes(verboseOverride) }),
 	}
 }
 
