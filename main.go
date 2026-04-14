@@ -55,8 +55,8 @@ type UIConfig struct {
 	// Theme for UI presentation (auto, minimal, etc.)
 	Theme string `yaml:"theme,omitempty"`
 	// Figlet font for the banner (if figlet is installed). Leave empty to use default ASCII art.
-	// Example: "big", "small", "banner"
-	BannerFont string `yaml:"banner_font,omitempty"`
+	// Try: "big", "small", "banner", "slant", "standard", etc.
+	BannerFont string `yaml:"banner_font"`
 	// Randomize the color palette on each run (true/false). Requires colors enabled.
 	// Available palettes: ocean, fire, forest, twilight, sunset, arctic, neon, vintage
 	RandomizeColors *bool `yaml:"randomize_colors,omitempty"`
@@ -173,9 +173,9 @@ func defaultConfig() *Config {
 		UI: UIConfig{
 			Colors:          &defaultColors,
 			Theme:           "auto",
-			BannerFont:      "", // Leave empty for default ASCII art, or try "big", "small", "banner" with figlet
+			BannerFont:      "",
 			RandomizeColors: &defaultRandomize,
-			ColorPalette:    "ocean", // Options: ocean, fire, forest, twilight, sunset, arctic, neon, vintage
+			ColorPalette:    "ocean",
 		},
 	}
 }

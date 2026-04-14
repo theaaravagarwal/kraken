@@ -294,14 +294,25 @@ func (u *uiTheme) applyConfig(colors *bool, bannerFont string, randomizeColors *
 	u.palette = ColorPalettes[selectedPalette]
 }
 
+// figletAvailable checks if figlet is installed on the system
+func figletAvailable() bool {
+	_, err := exec.LookPath("figlet")
+	return err == nil
+}
+
 func generateFigletBanner(font string) string {
+	// Don't attempt to run figlet if it's not available
+	if !figletAvailable() {
+		return ""
+	}
+
 	cmd := exec.Command("figlet", "-f", font, "kraken")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// figlet not installed or font not found — return empty
+		// figlet not installed, font not found, or other error — return empty
 		return ""
 	}
 
