@@ -6,6 +6,19 @@
 
 Makefiles are great for complex build pipelines, but overkill when you just want to compile a single file with the right flags. **kraken** eliminates boilerplate: it auto-detects the language from the file extension, applies pre-configured compiler flags, and optionally runs the output — all in one command.
 
+## Features
+
+- **One-command compile & run** — `kraken main.cpp` auto-detects language and runs the result
+- **Watch mode with hot-reload** — `kraken watch main.go` rebuilds and restarts on file changes
+- **Parallel test suite runner** — `kraken test solution.cpp tests/` runs all `*.in` / `*.out` pairs in parallel
+- **Configurable language profiles** — Built-in support for C, C++, Go, Rust, Java, Zig, D, Nim, V, Haskell (easy to add more)
+- **Smart dependency tracking** — For C/C++, tracks includes and skips unnecessary rebuilds
+- **Colorized output with customizable themes** — 8 color palettes (ocean, fire, forest, twilight, sunset, arctic, neon, vintage)
+- **Custom banner fonts** — Use figlet fonts (big, small, banner, slant, etc.) for stylized banners
+- **Temporary binary mode** — `kraken run --temp main.cpp` compiles in `/tmp` and cleans up automatically
+- **Verbose mode** — See exact compiler commands with `kraken --verbose`
+- **Environment diagnostics** — `kraken doctor` checks compiler availability and config health
+
 ## Install
 
 ### Method 1: One-line installer (Recommended)
@@ -62,7 +75,7 @@ The naming format must be: `kraken_<os>_<arch>.tar.gz` (e.g. `kraken_darwin_arm6
 
 ```bash
 # Initialize default config
-kraken --init
+kraken init
 
 # Compile and run a file (auto-detects language)
 kraken main.cpp
@@ -79,14 +92,20 @@ kraken watch main.cpp
 # Run parallel test suite (reads tests/*.in + tests/*.out)
 kraken test solution.cpp tests
 
-# Flag-first syntax for extra compiler flags
-kraken run --debug main.cpp
+# View available color themes
+kraken themes
 
 # Print the exact compiler command being executed
 kraken --verbose run main.cpp
 
 # Diagnose your environment
-kraken --doctor
+kraken doctor
+
+# Show available compilers and their status
+kraken list
+
+# Display version information
+kraken version
 ```
 
 ## Commands
@@ -100,6 +119,7 @@ kraken --doctor
 | `kraken watch <file>` | Watch for file changes and auto-rebuild/restart |
 | `kraken test <file> [dir]` | Run parallel test suite against input/output files |
 | `kraken list` | Show supported languages and compiler status |
+| `kraken themes` | Show available color themes and configuration examples |
 | `kraken init` | Generate default configuration file |
 | `kraken doctor` | Diagnose environment health |
 | `kraken version` | Show version information |
@@ -117,9 +137,9 @@ kraken --doctor
 
 ## Configuration
 
-kraken reads configuration from `~/.config/kraken/config.yaml`. Run `kraken --init` to generate a default config with profiles for C, C++, Go, Rust, Java, Zig, D, Nim, V, and Haskell.
+kraken reads configuration from `~/.config/kraken/config.yaml`. Run `kraken init` to generate a default config with profiles for C, C++, Go, Rust, Java, Zig, D, Nim, V, and Haskell.
 
-### Config Keys
+### Language Configuration
 
 | Key | Type | Description | Default |
 |---|---|---|---|
@@ -128,12 +148,33 @@ kraken reads configuration from `~/.config/kraken/config.yaml`. Run `kraken --in
 | `languages.<ext>.args` | `[]string` | Alternative to `flags` for non-standard CLIs (e.g. `go build -o`) | varies |
 | `languages.<ext>.output_flag` | `string` | Flag to specify output file (e.g. `-o`) | `-o` |
 | `languages.<ext>.output_ext` | `string` | Extension for the output binary | `""` |
+
+### Global Options
+
+| Key | Type | Description | Default |
+|---|---|---|---|
 | `options.auto_run` | `bool` | Auto-run binary after successful compilation | `false` |
 | `options.verbose` | `bool` | Print compile command and status messages | `true` |
 
-### Example Custom Profile
+### UI & Theming
+
+| Key | Type | Description | Default |
+|---|---|---|---|
+| `ui.colors` | `bool` | Enable/disable colored output | `true` |
+| `ui.theme` | `string` | UI theme name | `auto` |
+| `ui.banner_font` | `string` | Figlet font for the banner (big, small, banner, slant, etc.) | `""` (uses default ASCII art) |
+| `ui.randomize_colors` | `bool` | Randomize color palette on each run | `false` |
+| `ui.color_palette` | `string` | Specific color palette to use | `ocean` |
+
+**Available color palettes:** `ocean` (default), `fire`, `forest`, `twilight`, `sunset`, `arctic`, `neon`, `vintage`
+
+### Example Configuration
 
 ```yaml
+options:
+  verbose: true
+  auto_run: false
+
 languages:
   py:
     compiler: python3
@@ -142,6 +183,42 @@ languages:
     compiler: tsc
     flags: ["--target", "ES2022"]
     output_flag: "--outFile"
+
+ui:
+  colors: true
+  color_palette: fire
+  randomize_colors: false
+  banner_font: "big"
+```
+
+### Color Theme Examples
+
+View all available themes with their color samples:
+
+```bash
+kraken themes           # List all themes
+kraken --verbose themes # Show color samples for each theme
+```
+
+To use a specific theme, set `ui.color_palette` in `~/.config/kraken/config.yaml`:
+
+```yaml
+ui:
+  color_palette: neon  # Changes all output colors to the neon theme
+```
+
+To randomize colors on each run:
+
+```yaml
+ui:
+  randomize_colors: true  # Picks a random palette each time
+```
+
+To use custom figlet fonts (if figlet is installed):
+
+```yaml
+ui:
+  banner_font: "slant"  # Try: big, small, banner, slant, standard, etc.
 ```
 
 ## Environment Health

@@ -173,7 +173,7 @@ func defaultConfig() *Config {
 		UI: UIConfig{
 			Colors:          &defaultColors,
 			Theme:           "auto",
-			BannerFont:      "",
+			BannerFont:      "big",
 			RandomizeColors: &defaultRandomize,
 			ColorPalette:    "ocean",
 		},
@@ -771,6 +771,11 @@ func handleRun(args []string, verboseOverride *bool) error {
 		filtered = append(filtered, a)
 	}
 	if !temp {
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		applyUIFromConfig(cfg)
 		ui.printSessionHeader("run")
 		return handleCompileCommand(filtered, true, verboseOverride)
 	}
@@ -1272,6 +1277,11 @@ func handleInit() error {
 	if err := saveDefaultConfig(); err != nil {
 		return err
 	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	applyUIFromConfig(cfg)
 	cfgPath, _ := configPath()
 	ui.printSessionHeader("init")
 	fmt.Printf("%s %s\n", ui.success("Default config created at:"), cfgPath)
@@ -1361,11 +1371,15 @@ func commandRegistry(verboseOverride *bool) map[string]Command {
 
 func main() {
 	if len(os.Args) < 2 {
+		cfg, _ := loadConfig()
+		applyUIFromConfig(cfg)
 		printUsage()
 		os.Exit(0)
 	}
 	args, verboseOverride := parseLeadingGlobalFlags(os.Args[1:])
 	if len(args) == 0 {
+		cfg, _ := loadConfig()
+		applyUIFromConfig(cfg)
 		printUsage()
 		os.Exit(0)
 	}
