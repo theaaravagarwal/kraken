@@ -1,13 +1,25 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 )
 
@@ -15,7 +27,17 @@ const (
 	version    = "1.0.0"
 	configDir  = ".config/kraken"
 	configFile = "config.yaml"
+	cacheDir   = ".cache/kraken"
+	depsFile   = "deps.json"
 )
+
+const (
+	colorGreen = "\033[32m"
+	colorRed   = "\033[31m"
+	colorReset = "\033[0m"
+)
+
+var includeRegex = regexp.MustCompile(`^\s*#include\s+"([^"]+)"`)
 
 // LanguageProfile defines how a language is compiled.
 type LanguageProfile struct {
@@ -28,8 +50,8 @@ type LanguageProfile struct {
 
 // Options holds global settings.
 type Options struct {
-	AutoRun  bool `yaml:"auto_run,omitempty"`
-	Verbose  bool `yaml:"verbose,omitempty"`
+	AutoRun bool `yaml:"auto_run,omitempty"`
+	Verbose bool `yaml:"verbose,omitempty"`
 }
 
 // Config represents the full configuration.
@@ -38,7 +60,43 @@ type Config struct {
 	Options   Options                     `yaml:"options"`
 }
 
-// defaultConfig returns a Config with sensible defaults for common languages.
+type Command interface {
+	Execute(args []string) error
+}
+
+type commandFunc func(args []string) error
+
+func (f commandFunc) Execute(args []string) error {
+	return f(args)
+}
+
+type depEntry struct {
+	ModUnix  int64    `json:"mod_unix"`
+	Includes []string `json:"includes"`
+}
+
+type depCache struct {
+	Files map[string]depEntry `json:"files"`
+}
+
+type testCase struct {
+	Name         string
+	InputPath    string
+	ExpectedPath string
+}
+
+type testResult struct {
+	Name      string
+	Pass      bool
+	Duration  time.Duration
+	Expected  string
+	Actual    string
+	Stderr    string
+	RunErr    error
+	TimedOut  bool
+	InputPath string
+}
+
 func defaultConfig() *Config {
 	return &Config{
 		Languages: map[string]*LanguageProfile{
@@ -55,8 +113,8 @@ func defaultConfig() *Config {
 				OutputExt:  "",
 			},
 			"go": {
-				Compiler: "go",
-				Args:     []string{"build", "-o"},
+				Compiler:  "go",
+				Args:      []string{"build", "-o"},
 				OutputExt: "",
 			},
 			"rs": {
@@ -68,37 +126,29 @@ func defaultConfig() *Config {
 			"java": {
 				Compiler: "javac",
 				Flags:    []string{},
-				OutputFlag: "",
 			},
 			"zig": {
-				Compiler:   "zig",
-				Args:       []string{"build-exe", "-O", "ReleaseFast", "-femit-bin="},
-				OutputFlag: "",
-				OutputExt:  "",
+				Compiler: "zig",
+				Args:     []string{"build-exe", "-O", "ReleaseFast", "-femit-bin="},
 			},
 			"d": {
 				Compiler:   "dmd",
 				Flags:      []string{"-O", "-release"},
 				OutputFlag: "-of",
-				OutputExt:  "",
 			},
 			"nim": {
-				Compiler:   "nim",
-				Args:       []string{"c", "-d:release", "--outdir:"},
-				OutputFlag: "",
-				OutputExt:  "",
+				Compiler: "nim",
+				Args:     []string{"c", "-d:release", "--outdir:"},
 			},
 			"v": {
 				Compiler:   "v",
 				Flags:      []string{"-prod"},
 				OutputFlag: "-o",
-				OutputExt:  "",
 			},
 			"hs": {
 				Compiler:   "ghc",
 				Flags:      []string{"-O2"},
 				OutputFlag: "-o",
-				OutputExt:  "",
 			},
 		},
 		Options: Options{
@@ -108,7 +158,6 @@ func defaultConfig() *Config {
 	}
 }
 
-// configPath returns the full path to the config file.
 func configPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -117,7 +166,14 @@ func configPath() (string, error) {
 	return filepath.Join(home, configDir, configFile), nil
 }
 
-// ensureConfigDir creates ~/.config/kraken if it doesn't exist.
+func cachePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not get home directory: %w", err)
+	}
+	return filepath.Join(home, cacheDir, depsFile), nil
+}
+
 func ensureConfigDir() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -127,7 +183,15 @@ func ensureConfigDir() error {
 	return os.MkdirAll(dir, 0755)
 }
 
-// loadConfig reads the config from disk, falling back to defaults if missing.
+func ensureCacheDir() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(home, cacheDir)
+	return os.MkdirAll(dir, 0755)
+}
+
 func loadConfig() (*Config, error) {
 	cfgPath, err := configPath()
 	if err != nil {
@@ -143,19 +207,17 @@ func loadConfig() (*Config, error) {
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("could not parse config: %w", err)
 	}
-
-	// fill in any nil entries
 	if cfg.Languages == nil {
 		cfg.Languages = make(map[string]*LanguageProfile)
 	}
-
 	return &cfg, nil
 }
 
-// saveDefaultConfig writes the default config to disk.
 func saveDefaultConfig() error {
 	if err := ensureConfigDir(); err != nil {
 		return err
@@ -173,14 +235,48 @@ func saveDefaultConfig() error {
 	return os.WriteFile(cfgPath, data, 0644)
 }
 
-// findCompiler checks if a compiler binary exists in $PATH.
+func loadDepCache() (*depCache, error) {
+	path, err := cachePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &depCache{Files: map[string]depEntry{}}, nil
+		}
+		return nil, err
+	}
+	var c depCache
+	if err := json.Unmarshal(data, &c); err != nil {
+		return &depCache{Files: map[string]depEntry{}}, nil
+	}
+	if c.Files == nil {
+		c.Files = map[string]depEntry{}
+	}
+	return &c, nil
+}
+
+func saveDepCache(c *depCache) error {
+	if err := ensureCacheDir(); err != nil {
+		return err
+	}
+	path, err := cachePath()
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
 func findCompiler(name string) (string, error) {
 	return exec.LookPath(name)
 }
 
-// getCompilerVersion tries to get a version string from the compiler.
 func getCompilerVersion(path string) string {
-	// Go uses "go version" instead of "go --version"
 	if strings.HasSuffix(path, "go") || strings.HasSuffix(path, "go.exe") {
 		cmd := exec.Command(path, "version")
 		out, err := cmd.CombinedOutput()
@@ -189,42 +285,30 @@ func getCompilerVersion(path string) string {
 		}
 		return strings.TrimSpace(string(out))
 	}
-
 	cmd := exec.Command(path, "--version")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "unknown"
 	}
-	// Return just the first line
 	line := strings.SplitN(string(out), "\n", 2)[0]
 	return line
 }
 
-// lookupByExt maps a file extension to a language profile key.
 func lookupByExt(ext string) string {
-	// Strip leading dot
-	ext = strings.TrimPrefix(ext, ".")
-	return ext
+	return strings.TrimPrefix(ext, ".")
 }
 
-// buildCommand constructs the full compile command from a profile.
 func buildCommand(profile *LanguageProfile, inputFile, outputFile string, extraArgs []string) []string {
 	var args []string
-
-	// If the profile uses Args (like "go build -o"), handle that path
 	if len(profile.Args) > 0 {
 		args = append(args, profile.Args...)
-		// For Args, the output path is typically appended after the last arg
-		// e.g., ["build", "-o"] -> append outputFile after "-o"
 		lastArg := args[len(args)-1]
 		if strings.HasSuffix(lastArg, "=") {
-			// Some compilers use --outdir=file syntax
 			args[len(args)-1] = lastArg + outputFile
 		} else if outputFile != "" {
 			args = append(args, outputFile)
 		}
 	} else {
-		// Standard flags + output flag
 		if len(profile.Flags) > 0 {
 			args = append(args, profile.Flags...)
 		}
@@ -232,15 +316,10 @@ func buildCommand(profile *LanguageProfile, inputFile, outputFile string, extraA
 			args = append(args, profile.OutputFlag, outputFile)
 		}
 	}
-
-	// Input file
 	args = append(args, inputFile)
-
-	// Extra args from command line
 	if len(extraArgs) > 0 {
 		args = append(args, extraArgs...)
 	}
-
 	return args
 }
 
@@ -252,61 +331,743 @@ func printUsage() {
 	fmt.Println(`kraken — smart compilation wrapper
 
 USAGE:
-  kraken <file> [extra flags...]    Compile and optionally run
-  kraken --list                     Show available compilers
-  kraken --init                     Generate default config
-  kraken --run <file>               Compile and run immediately
-  kraken --doctor                   Check environment health
-  kraken --version                  Show version
-  kraken --help                     Show this help
+  kraken [--verbose] <file>         Compile and run (smart root mode)
+  kraken run [--temp] <file> [flags...]
+  kraken watch <file> [flags...]    Watch and rebuild on change
+  kraken test <file> [tests-dir]    Run parallel judge against *.in/*.out
+  kraken list                       Show available compilers
+  kraken init                       Generate default config
+  kraken doctor                     Check environment health
+  kraken version                    Show version
+  kraken help                       Show this help
 
 EXAMPLES:
-  kraken main.cpp                   Compile with configured flags
-  kraken main.cpp --debug           Append --debug to the compile command
-  kraken --run main.go              Build and run immediately
-  kraken --list                     Check which compilers are available
-  kraken --doctor                   Verify your setup is healthy
-
-CONFIG:
-  ~/.config/kraken/config.yaml      Language profiles and settings
-
-INSTALL:
-  go install github.com/theaaravagarwal/kraken@latest`)
+  kraken run --temp main.cpp
+  kraken watch main.cpp
+  kraken test solution.cpp tests`)
 }
 
-func cmdList(cfg *Config) {
+func parseCompileInvocation(args []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", nil, fmt.Errorf("missing source file argument")
+	}
+	file := ""
+	extraArgs := make([]string, 0, len(args))
+	for _, arg := range args {
+		if file == "" && !strings.HasPrefix(arg, "-") {
+			file = arg
+			continue
+		}
+		extraArgs = append(extraArgs, arg)
+	}
+	if file == "" {
+		return "", nil, fmt.Errorf("missing source file argument")
+	}
+	return file, extraArgs, nil
+}
+
+func isCCLike(lang string) bool {
+	switch lang {
+	case "c", "cpp", "cc", "cxx":
+		return true
+	default:
+		return false
+	}
+}
+
+func scanIncludes(absFile string) ([]string, error) {
+	f, err := os.Open(absFile)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	s := bufio.NewScanner(f)
+	includes := []string{}
+	for s.Scan() {
+		m := includeRegex.FindStringSubmatch(s.Text())
+		if len(m) == 2 {
+			includes = append(includes, m[1])
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	return includes, nil
+}
+
+func collectDepsBFS(root string, cache *depCache) ([]string, error) {
+	queue := []string{root}
+	visited := map[string]bool{}
+	deps := []string{}
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if visited[cur] {
+			continue
+		}
+		visited[cur] = true
+		deps = append(deps, cur)
+
+		st, err := os.Stat(cur)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		mod := st.ModTime().UnixNano()
+		entry, ok := cache.Files[cur]
+		includes := entry.Includes
+		if !ok || entry.ModUnix != mod {
+			includes, err = scanIncludes(cur)
+			if err != nil {
+				continue
+			}
+			cache.Files[cur] = depEntry{ModUnix: mod, Includes: includes}
+		}
+		base := filepath.Dir(cur)
+		for _, inc := range includes {
+			next := filepath.Clean(filepath.Join(base, inc))
+			if _, err := os.Stat(next); err == nil {
+				queue = append(queue, next)
+			}
+		}
+	}
+
+	return deps, nil
+}
+
+func shouldRebuild(absFile, output string, cache *depCache) (bool, error) {
+	outStat, err := os.Stat(output)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return true, err
+	}
+	outMod := outStat.ModTime()
+
+	deps, err := collectDepsBFS(absFile, cache)
+	if err != nil {
+		return true, nil
+	}
+	for _, dep := range deps {
+		st, err := os.Stat(dep)
+		if err != nil {
+			return true, nil
+		}
+		if st.ModTime().After(outMod) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func resolveCompile(cfg *Config, file string, extraArgs []string, outputOverride string, useDirtyCheck bool) (string, string, string, error) {
+	absFile, err := filepath.Abs(file)
+	if err != nil {
+		return "", "", "", fmt.Errorf("invalid file path: %w", err)
+	}
+	if _, err := os.Stat(absFile); os.IsNotExist(err) {
+		return "", "", "", fmt.Errorf("file not found: %s", file)
+	}
+
+	ext := filepath.Ext(absFile)
+	if ext == "" {
+		return "", "", "", fmt.Errorf("file has no extension, cannot determine language: %s", file)
+	}
+	lang := lookupByExt(ext)
+	profile, ok := cfg.Languages[lang]
+	if !ok {
+		return "", "", "", fmt.Errorf("no language profile for extension '%s'", lang)
+	}
+	compilerPath, err := findCompiler(profile.Compiler)
+	if err != nil {
+		return "", "", "", fmt.Errorf("compiler '%s' not found in PATH", profile.Compiler)
+	}
+
+	baseName := strings.TrimSuffix(filepath.Base(absFile), ext)
+	outputPath := outputOverride
+	if outputPath == "" && lang != "java" {
+		outputPath = filepath.Join(filepath.Dir(absFile), baseName+profile.OutputExt)
+	}
+
+	if useDirtyCheck && isCCLike(lang) && outputPath != "" {
+		c, _ := loadDepCache()
+		if c != nil {
+			dirty, _ := shouldRebuild(absFile, outputPath, c)
+			_ = saveDepCache(c)
+			if !dirty {
+				if cfg.Options.Verbose {
+					fmt.Println("[EXEC]: skipped compile (dependency graph unchanged)")
+				}
+				return outputPath, absFile, lang, nil
+			}
+		}
+	}
+
+	cmdArgs := buildCommand(profile, absFile, outputPath, extraArgs)
+	if cfg.Options.Verbose {
+		fmt.Printf("[EXEC]: %s %s\n", profile.Compiler, strings.Join(cmdArgs, " "))
+		fmt.Println(strings.Repeat("─", 60))
+	}
+
+	cmd := exec.Command(compilerPath, cmdArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		return "", "", "", err
+	}
+	if cfg.Options.Verbose {
+		fmt.Println("compilation successful ✓")
+	}
+	return outputPath, absFile, lang, nil
+}
+
+func setPGID(cmd *exec.Cmd) {
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
+}
+
+func killProcessGroup(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	if runtime.GOOS == "windows" {
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		return p.Kill()
+	}
+	return syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+func runBinary(lang, absFile, runPath string, workDir string) error {
+	if lang == "java" {
+		javaPath, err := findCompiler("java")
+		if err != nil {
+			return fmt.Errorf("java runtime not found")
+		}
+		base := strings.TrimSuffix(filepath.Base(absFile), filepath.Ext(absFile))
+		fmt.Printf("running: java %s\n", base)
+		cmd := exec.Command(javaPath, "-cp", filepath.Dir(absFile), base)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		if workDir != "" {
+			cmd.Dir = workDir
+		}
+		setPGID(cmd)
+		return runWithSignalCleanup(cmd)
+	}
+
+	fmt.Printf("running: %s\n", runPath)
+	cmd := exec.Command(runPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	setPGID(cmd)
+	return runWithSignalCleanup(cmd)
+}
+
+func runWithSignalCleanup(cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-sigCh:
+		_ = killProcessGroup(cmd.Process.Pid)
+		<-done
+		return errors.New("interrupted")
+	}
+}
+
+func cmdCompile(cfg *Config, file string, extraArgs []string, runAfter bool) error {
+	runPath, absFile, lang, err := resolveCompile(cfg, file, extraArgs, "", true)
+	if err != nil {
+		if cfg.Options.Verbose {
+			fmt.Printf("\ncompilation failed (exit code: %v)\n", err)
+		}
+		return err
+	}
+	if runAfter || cfg.Options.AutoRun {
+		return runBinary(lang, absFile, runPath, filepath.Dir(absFile))
+	}
+	return nil
+}
+
+func parseLeadingGlobalFlags(args []string) ([]string, *bool) {
+	var verboseOverride *bool
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "--verbose":
+			v := true
+			verboseOverride = &v
+			i++
+		default:
+			return args[i:], verboseOverride
+		}
+	}
+	return []string{}, verboseOverride
+}
+
+func isLikelySourceFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func handleCompileCommand(args []string, runAfter bool, verboseOverride *bool) error {
+	file, extraArgs, err := parseCompileInvocation(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("error loading config: %w", err)
+	}
+	if verboseOverride != nil {
+		cfg.Options.Verbose = *verboseOverride
+	}
+	return cmdCompile(cfg, file, extraArgs, runAfter)
+}
+
+func handleRun(args []string, verboseOverride *bool) error {
+	temp := false
+	filtered := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--temp" {
+			temp = true
+			continue
+		}
+		filtered = append(filtered, a)
+	}
+	if !temp {
+		return handleCompileCommand(filtered, true, verboseOverride)
+	}
+
+	file, extraArgs, err := parseCompileInvocation(filtered)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if verboseOverride != nil {
+		cfg.Options.Verbose = *verboseOverride
+	}
+	tempDir, err := os.MkdirTemp("", "kraken-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tempDir)
+
+	base := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+	tempBin := filepath.Join(tempDir, base)
+	runPath, absFile, lang, err := resolveCompile(cfg, file, extraArgs, tempBin, false)
+	if err != nil {
+		return err
+	}
+	if cfg.Options.Verbose {
+		fmt.Printf("[temp] %s\n", tempDir)
+	}
+	return runBinary(lang, absFile, runPath, filepath.Dir(absFile))
+}
+
+func clearScreen() {
+	fmt.Print("\033[2J\033[H")
+}
+
+func handleWatch(args []string, verboseOverride *bool) error {
+	file, extraArgs, err := parseCompileInvocation(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if verboseOverride != nil {
+		cfg.Options.Verbose = *verboseOverride
+	}
+	absFile, err := filepath.Abs(file)
+	if err != nil {
+		return err
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+	if err := watcher.Add(filepath.Dir(absFile)); err != nil {
+		return err
+	}
+
+	var running *exec.Cmd
+	killRunning := func() {
+		if running != nil && running.Process != nil {
+			_ = killProcessGroup(running.Process.Pid)
+			_, _ = running.Process.Wait()
+			running = nil
+		}
+	}
+
+	rebuild := func(reason string) {
+		clearScreen()
+		fmt.Printf("kraken watch — %s (%s)\n", file, reason)
+		fmt.Println(strings.Repeat("=", 60))
+		killRunning()
+
+		runPath, abs, lang, buildErr := resolveCompile(cfg, file, extraArgs, "", true)
+		if buildErr != nil {
+			fmt.Printf("build failed: %v\n", buildErr)
+			return
+		}
+		if lang == "java" {
+			javaPath, err := findCompiler("java")
+			if err != nil {
+				fmt.Printf("run failed: %v\n", err)
+				return
+			}
+			base := strings.TrimSuffix(filepath.Base(abs), filepath.Ext(abs))
+			running = exec.Command(javaPath, "-cp", filepath.Dir(abs), base)
+		} else {
+			running = exec.Command(runPath)
+		}
+		running.Dir = filepath.Dir(abs)
+		running.Stdout = os.Stdout
+		running.Stderr = os.Stderr
+		running.Stdin = os.Stdin
+		setPGID(running)
+		if err := running.Start(); err != nil {
+			fmt.Printf("run failed: %v\n", err)
+			running = nil
+			return
+		}
+		fmt.Printf("running pid=%d\n", running.Process.Pid)
+	}
+
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	pending := false
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	rebuild("initial build")
+
+	for {
+		select {
+		case ev := <-watcher.Events:
+			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
+				continue
+			}
+			pending = true
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(100 * time.Millisecond)
+		case err := <-watcher.Errors:
+			fmt.Printf("watch error: %v\n", err)
+		case <-timer.C:
+			if pending {
+				pending = false
+				rebuild("file change")
+			}
+		case <-sigCh:
+			killRunning()
+			return nil
+		}
+	}
+}
+
+func normalizeOutput(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimRight(lines[i], " \t")
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func sideBySideDiff(expected, actual string) string {
+	e := strings.Split(expected, "\n")
+	a := strings.Split(actual, "\n")
+	max := len(e)
+	if len(a) > max {
+		max = len(a)
+	}
+	var b strings.Builder
+	b.WriteString("line | expected                              | actual\n")
+	b.WriteString("-----+---------------------------------------+---------------------------------------\n")
+	for i := 0; i < max; i++ {
+		ev := ""
+		av := ""
+		if i < len(e) {
+			ev = e[i]
+		}
+		if i < len(a) {
+			av = a[i]
+		}
+		if ev == av {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("%4d | %-37s | %-37s\n", i+1, ev, av))
+	}
+	return b.String()
+}
+
+func discoverTestCases(dir string) ([]testCase, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.in"))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	cases := make([]testCase, 0, len(matches))
+	for _, in := range matches {
+		name := strings.TrimSuffix(filepath.Base(in), ".in")
+		out := filepath.Join(dir, name+".out")
+		if _, err := os.Stat(out); err != nil {
+			continue
+		}
+		cases = append(cases, testCase{Name: name, InputPath: in, ExpectedPath: out})
+	}
+	return cases, nil
+}
+
+func runTestCase(binaryPath, workDir string, tc testCase, timeout time.Duration) testResult {
+	res := testResult{Name: tc.Name, InputPath: tc.InputPath}
+	input, err := os.ReadFile(tc.InputPath)
+	if err != nil {
+		res.RunErr = err
+		return res
+	}
+	expectedRaw, err := os.ReadFile(tc.ExpectedPath)
+	if err != nil {
+		res.RunErr = err
+		return res
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binaryPath)
+	cmd.Dir = workDir
+	cmd.Stdin = bytes.NewReader(input)
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	setPGID(cmd)
+
+	start := time.Now()
+	err = cmd.Run()
+	res.Duration = time.Since(start)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		res.TimedOut = true
+	}
+
+	actualNorm := normalizeOutput(stdoutBuf.String())
+	expectedNorm := normalizeOutput(string(expectedRaw))
+	res.Expected = expectedNorm
+	res.Actual = actualNorm
+	res.Stderr = stderrBuf.String()
+	res.RunErr = err
+	res.Pass = !res.TimedOut && err == nil && actualNorm == expectedNorm
+	return res
+}
+
+func parseTestInvocation(args []string) (string, string, []string, error) {
+	file, rest, err := parseCompileInvocation(args)
+	if err != nil {
+		return "", "", nil, err
+	}
+	testsDir := "tests"
+	compileFlags := rest
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		if st, err := os.Stat(rest[0]); err == nil && st.IsDir() {
+			testsDir = rest[0]
+			compileFlags = rest[1:]
+		}
+	}
+	return file, testsDir, compileFlags, nil
+}
+
+func handleTest(args []string, verboseOverride *bool) error {
+	file, testsDir, compileFlags, err := parseTestInvocation(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if verboseOverride != nil {
+		cfg.Options.Verbose = *verboseOverride
+	}
+	if cfg.Options.Verbose {
+		fmt.Println("[normalize]: CRLF->LF, trim trailing whitespace, trim trailing empty lines")
+	}
+
+	tempDir, err := os.MkdirTemp("", "kraken-test-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tempDir)
+
+	base := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+	binaryPath := filepath.Join(tempDir, base)
+	_, absFile, lang, err := resolveCompile(cfg, file, compileFlags, binaryPath, false)
+	if err != nil {
+		return err
+	}
+	if lang == "java" {
+		return fmt.Errorf("kraken test currently supports native binaries only")
+	}
+
+	cases, err := discoverTestCases(testsDir)
+	if err != nil {
+		return err
+	}
+	if len(cases) == 0 {
+		return fmt.Errorf("no testcases found in %s (*.in/*.out)", testsDir)
+	}
+
+	jobs := make(chan testCase, len(cases))
+	results := make(chan testResult, len(cases))
+	workerCount := runtime.NumCPU()
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tc := range jobs {
+				results <- runTestCase(binaryPath, filepath.Dir(absFile), tc, 2*time.Second)
+			}
+		}()
+	}
+
+	for _, tc := range cases {
+		jobs <- tc
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	all := make([]testResult, 0, len(cases))
+	for r := range results {
+		all = append(all, r)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+
+	failed := 0
+	for _, r := range all {
+		if r.Pass {
+			fmt.Printf("%s[PASS]%s %s (%s)\n", colorGreen, colorReset, r.Name, r.Duration.Round(time.Millisecond))
+			continue
+		}
+		failed++
+		fmt.Printf("%s[FAIL]%s %s (%s)\n", colorRed, colorReset, r.Name, r.Duration.Round(time.Millisecond))
+		if r.TimedOut {
+			fmt.Println("  reason: timeout")
+		}
+		if r.RunErr != nil && !r.TimedOut {
+			fmt.Printf("  reason: %v\n", r.RunErr)
+		}
+		if r.Stderr != "" {
+			fmt.Printf("  stderr:\n%s\n", indent(r.Stderr, "    "))
+		}
+		fmt.Println(indent(sideBySideDiff(r.Expected, r.Actual), "  "))
+	}
+	fmt.Printf("\nsummary: %d/%d passed\n", len(all)-failed, len(all))
+	if failed > 0 {
+		return fmt.Errorf("%d test(s) failed", failed)
+	}
+	return nil
+}
+
+func indent(s, prefix string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func handleList(verboseOverride *bool) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if verboseOverride != nil {
+		cfg.Options.Verbose = *verboseOverride
+	}
 	fmt.Println("Compiler availability:")
 	fmt.Println(strings.Repeat("─", 60))
-
 	for lang, profile := range cfg.Languages {
 		path, err := findCompiler(profile.Compiler)
 		status := "✗ Missing"
 		version := "— not found"
-
 		if err == nil {
 			status = "✓ Available"
 			version = getCompilerVersion(path)
 		}
-
 		fmt.Printf("  %-10s %-12s %s\n", lang, status, profile.Compiler)
 		if cfg.Options.Verbose && err == nil {
 			fmt.Printf("             → %s\n", version)
 		}
 	}
-	fmt.Println()
-
-	// Show config path
 	cfgPath, _ := configPath()
-	fmt.Printf("Config: %s\n", cfgPath)
+	fmt.Printf("\nConfig: %s\n", cfgPath)
+	return nil
 }
 
-func cmdDoctor(cfg *Config) {
+func handleDoctor(verboseOverride *bool) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if verboseOverride != nil {
+		cfg.Options.Verbose = *verboseOverride
+	}
+
 	fmt.Println("kraken doctor — environment health check")
 	fmt.Println(strings.Repeat("=", 60))
-
 	allGood := true
 
-	// 1. Check compilers in PATH
 	fmt.Println("\n[Compilers in PATH]")
 	for lang, profile := range cfg.Languages {
 		path, err := findCompiler(profile.Compiler)
@@ -314,12 +1075,20 @@ func cmdDoctor(cfg *Config) {
 			fmt.Printf("  ✗ %-10s %s (not in PATH)\n", lang, profile.Compiler)
 			allGood = false
 		} else {
-			ver := getCompilerVersion(path)
-			fmt.Printf("  ✓ %-10s %s → %s\n", lang, profile.Compiler, ver)
+			fmt.Printf("  ✓ %-10s %s → %s\n", lang, profile.Compiler, getCompilerVersion(path))
 		}
 	}
 
-	// 2. Config health
+	fmt.Println("\n[Required Toolchains]")
+	for _, tool := range []string{"g++", "clang", "go"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			fmt.Printf("  ✗ %s not found\n", tool)
+			allGood = false
+		} else {
+			fmt.Printf("  ✓ %s found\n", tool)
+		}
+	}
+
 	fmt.Println("\n[Configuration]")
 	cfgPath, err := configPath()
 	if err != nil {
@@ -327,51 +1096,23 @@ func cmdDoctor(cfg *Config) {
 		allGood = false
 	} else {
 		fmt.Printf("  Config path: %s\n", cfgPath)
-		_, err := os.Stat(cfgPath)
-		if os.IsNotExist(err) {
-			fmt.Printf("  ⚠ Config file does not exist (run `kraken --init` to create)\n")
-		} else if err != nil {
-			fmt.Printf("  ✗ Could not stat config file: %v\n", err)
-			allGood = false
-		} else {
-			// Validate YAML
-			data, readErr := os.ReadFile(cfgPath)
-			if readErr != nil {
+		data, readErr := os.ReadFile(cfgPath)
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				fmt.Println("  ⚠ Config file does not exist (run `kraken init`)")
+			} else {
 				fmt.Printf("  ✗ Could not read config file: %v\n", readErr)
 				allGood = false
-			} else {
-				var testCfg Config
-				if parseErr := yaml.Unmarshal(data, &testCfg); parseErr != nil {
-					fmt.Printf("  ✗ Config YAML is invalid: %v\n", parseErr)
-					allGood = false
-				} else {
-					fmt.Printf("  ✓ Config YAML is valid\n")
-				}
 			}
-		}
-	}
-
-	// 3. Permissions
-	fmt.Println("\n[Permissions]")
-	home, homeErr := os.UserHomeDir()
-	if homeErr != nil {
-		fmt.Printf("  ✗ Could not get home directory: %v\n", homeErr)
-		allGood = false
-	} else {
-		krakenDir := filepath.Join(home, configDir)
-		// Check if we can write to the directory (create if missing)
-		if err := os.MkdirAll(krakenDir, 0755); err != nil {
-			fmt.Printf("  ✗ Cannot create config directory %s: %v\n", krakenDir, err)
-			allGood = false
 		} else {
-			// Try writing a test file
-			testFile := filepath.Join(krakenDir, ".write_test")
-			if err := os.WriteFile(testFile, []byte(""), 0644); err != nil {
-				fmt.Printf("  ✗ Cannot write to %s: %v\n", krakenDir, err)
+			var testCfg Config
+			dec := yaml.NewDecoder(bytes.NewReader(data))
+			dec.KnownFields(true)
+			if parseErr := dec.Decode(&testCfg); parseErr != nil {
+				fmt.Printf("  ✗ Config YAML is invalid: %v\n", parseErr)
 				allGood = false
 			} else {
-				os.Remove(testFile)
-				fmt.Printf("  ✓ Can write to %s\n", krakenDir)
+				fmt.Printf("  ✓ Config YAML is valid\n")
 			}
 		}
 	}
@@ -382,186 +1123,67 @@ func cmdDoctor(cfg *Config) {
 	} else {
 		fmt.Println("Some checks failed — review the output above")
 	}
-}
-
-func cmdCompile(cfg *Config, file string, extraArgs []string, runAfter bool) error {
-	// Resolve the file path
-	absFile, err := filepath.Abs(file)
-	if err != nil {
-		return fmt.Errorf("invalid file path: %w", err)
-	}
-
-	if _, err := os.Stat(absFile); os.IsNotExist(err) {
-		return fmt.Errorf("file not found: %s", file)
-	}
-
-	// Determine language from extension
-	ext := filepath.Ext(file)
-	if ext == "" {
-		return fmt.Errorf("file has no extension, cannot determine language: %s", file)
-	}
-
-	lang := lookupByExt(ext)
-	profile, ok := cfg.Languages[lang]
-	if !ok {
-		return fmt.Errorf("no language profile for extension '%s'\nAdd it to ~/.config/kraken/config.yaml", lang)
-	}
-
-	// Check compiler exists
-	compilerPath, err := findCompiler(profile.Compiler)
-	if err != nil {
-		return fmt.Errorf("compiler '%s' not found in PATH", profile.Compiler)
-	}
-
-	// Determine output file name
-	baseName := strings.TrimSuffix(filepath.Base(file), ext)
-	outputFile := baseName
-
-	// Handle java specially (javac produces .class files, can't rename easily)
-	if lang == "java" {
-		outputFile = ""
-	}
-
-	// Build the command
-	var cmdArgs []string
-	if outputFile != "" {
-		cmdArgs = buildCommand(profile, absFile, outputFile, extraArgs)
-	} else {
-		cmdArgs = buildCommand(profile, absFile, "", extraArgs)
-	}
-
-	// Print command if verbose
-	if cfg.Options.Verbose {
-		fmt.Printf("compiling: %s %s\n", profile.Compiler, strings.Join(cmdArgs, " "))
-		fmt.Println(strings.Repeat("─", 60))
-	}
-
-	// Execute
-	cmd := exec.Command(compilerPath, cmdArgs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	err = cmd.Run()
-	if err != nil {
-		// Compiler failed — don't run
-		if cfg.Options.Verbose {
-			fmt.Printf("\ncompilation failed (exit code: %s)\n", err)
-		}
-		return err
-	}
-
-	if cfg.Options.Verbose {
-		fmt.Println("compilation successful ✓")
-	}
-
-	// Auto-run if requested
-	if runAfter || cfg.Options.AutoRun {
-		var runPath string
-		if outputFile != "" {
-			runPath = filepath.Join(filepath.Dir(absFile), outputFile)
-		} else {
-			// For java, try running the class file
-			if lang == "java" {
-				javaPath, _ := findCompiler("java")
-				if javaPath == "" {
-					return fmt.Errorf("'java' runtime not found in PATH")
-				}
-				fmt.Printf("running: java %s\n", baseName)
-				runCmd := exec.Command(javaPath, "-cp", filepath.Dir(absFile), baseName)
-				runCmd.Stdout = os.Stdout
-				runCmd.Stderr = os.Stderr
-				runCmd.Stdin = os.Stdin
-				return runCmd.Run()
-			}
-			runPath = absFile // fallback
-		}
-
-		if lang == "go" {
-			// Go outputs a binary; run it
-		}
-
-		fmt.Printf("running: %s\n", runPath)
-		runCmd := exec.Command(runPath)
-		runCmd.Stdout = os.Stdout
-		runCmd.Stderr = os.Stderr
-		runCmd.Stdin = os.Stdin
-		if err := runCmd.Run(); err != nil {
-			return fmt.Errorf("run failed: %w", err)
-		}
-	}
-
 	return nil
 }
 
-func main() {
-	args := os.Args[1:]
+func handleInit() error {
+	if err := saveDefaultConfig(); err != nil {
+		return err
+	}
+	cfgPath, _ := configPath()
+	fmt.Printf("Default config created at: %s\n", cfgPath)
+	return nil
+}
 
+func commandRegistry(verboseOverride *bool) map[string]Command {
+	return map[string]Command{
+		"help":      commandFunc(func(args []string) error { printUsage(); return nil }),
+		"--help":    commandFunc(func(args []string) error { printUsage(); return nil }),
+		"-h":        commandFunc(func(args []string) error { printUsage(); return nil }),
+		"version":   commandFunc(func(args []string) error { printVersion(); return nil }),
+		"--version": commandFunc(func(args []string) error { printVersion(); return nil }),
+		"-v":        commandFunc(func(args []string) error { printVersion(); return nil }),
+		"run":       commandFunc(func(args []string) error { return handleRun(args, verboseOverride) }),
+		"--run":     commandFunc(func(args []string) error { return handleRun(args, verboseOverride) }),
+		"-r":        commandFunc(func(args []string) error { return handleRun(args, verboseOverride) }),
+		"watch":     commandFunc(func(args []string) error { return handleWatch(args, verboseOverride) }),
+		"test":      commandFunc(func(args []string) error { return handleTest(args, verboseOverride) }),
+		"init":      commandFunc(func(args []string) error { return handleInit() }),
+		"--init":    commandFunc(func(args []string) error { return handleInit() }),
+		"doctor":    commandFunc(func(args []string) error { return handleDoctor(verboseOverride) }),
+		"--doctor":  commandFunc(func(args []string) error { return handleDoctor(verboseOverride) }),
+		"list":      commandFunc(func(args []string) error { return handleList(verboseOverride) }),
+		"--list":    commandFunc(func(args []string) error { return handleList(verboseOverride) }),
+		"-l":        commandFunc(func(args []string) error { return handleList(verboseOverride) }),
+	}
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(0)
+	}
+	args, verboseOverride := parseLeadingGlobalFlags(os.Args[1:])
 	if len(args) == 0 {
 		printUsage()
 		os.Exit(0)
 	}
 
-	// Handle flags
-	switch args[0] {
-	case "--help", "-h":
-		printUsage()
-		os.Exit(0)
-	case "--version", "-v":
-		printVersion()
-		os.Exit(0)
-	case "--list", "-l":
-		cfg, err := loadConfig()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		cmdList(cfg)
-		os.Exit(0)
-	case "--init":
-		if err := saveDefaultConfig(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating config: %v\n", err)
-			os.Exit(1)
-		}
-		cfgPath, _ := configPath()
-		fmt.Printf("Default config created at: %s\n", cfgPath)
-		os.Exit(0)
-	case "--run", "-r":
-		// --run <file> [extra...]
-		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "Error: --run requires a file argument\n")
-			os.Exit(1)
-		}
-		cfg, err := loadConfig()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := cmdCompile(cfg, args[1], args[2:], true); err != nil {
-			os.Exit(1)
-		}
-		os.Exit(0)
-	case "--doctor":
-		cfg, err := loadConfig()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		cmdDoctor(cfg)
-		os.Exit(0)
+	subcommand := args[0]
+	rest := args[1:]
+	registry := commandRegistry(verboseOverride)
+
+	var err error
+	if cmd, ok := registry[subcommand]; ok {
+		err = cmd.Execute(rest)
+	} else if isLikelySourceFile(subcommand) {
+		err = handleRun(args, verboseOverride)
+	} else {
+		err = fmt.Errorf("unknown command or file: %s", subcommand)
 	}
 
-	// Default: treat first arg as file
-	file := args[0]
-	extraArgs := args[1:]
-
-	cfg, err := loadConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := cmdCompile(cfg, file, extraArgs, false); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }

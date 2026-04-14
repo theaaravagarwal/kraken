@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# kraken one-line installer
+# kraken one-line installer from GitHub Releases
 # Usage: curl -sSL https://raw.githubusercontent.com/theaaravagarwal/kraken/main/install.sh | bash
 #
 
@@ -8,44 +8,32 @@ set -euo pipefail
 
 REPO="theaaravagarwal/kraken"
 BINARY="kraken"
+INSTALL_DIR="${KRAKEN_INSTALL_DIR:-$HOME/.local/bin}"
 
-echo "🔧 Installing kraken via go install..."
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
 
-# Check if Go is installed
-if ! command -v go &>/dev/null; then
-    echo "❌ Error: Go is not installed or not in PATH."
-    echo "   Install Go from https://go.dev/dl/ then run this script again."
+case "$ARCH" in
+  x86_64|amd64) ARCH="amd64" ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *)
+    echo "Unsupported architecture: $ARCH"
     exit 1
-fi
+    ;;
+esac
 
-# Use go install to place the binary in $GOPATH/bin or $HOME/go/bin
-echo "📦 Running: go install github.com/${REPO}@latest"
-go install "github.com/${REPO}@latest"
+ASSET="${BINARY}_${OS}_${ARCH}.tar.gz"
+URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 
-# Determine where go install put the binary
-INSTALL_DIR=""
-if [ -n "${GOPATH:-}" ]; then
-    INSTALL_DIR="${GOPATH}/bin"
-else
-    INSTALL_DIR="${HOME}/go/bin"
-fi
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-BINARY_PATH="${INSTALL_DIR}/${BINARY}"
+echo "Downloading: $URL"
+curl -fsSL "$URL" -o "$TMP_DIR/$ASSET"
 
-if [ -f "${BINARY_PATH}" ]; then
-    echo ""
-    echo "✅ kraken installed successfully!"
-    echo "   Binary: ${BINARY_PATH}"
-    echo ""
-    echo "   If 'kraken' is not in your PATH, add this to your shell config:"
-    echo "     export PATH=\"${INSTALL_DIR}:\$PATH\""
-    echo ""
-    echo "   Quick start:"
-    echo "     kraken --help"
-    echo "     kraken --init"
-else
-    echo ""
-    echo "❌ Installation completed but binary not found at ${BINARY_PATH}"
-    echo "   Try running: go install github.com/${REPO}@latest"
-    exit 1
-fi
+tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
+mkdir -p "$INSTALL_DIR"
+install -m 0755 "$TMP_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
+
+echo "Installed: $INSTALL_DIR/$BINARY"
+echo "If needed, add to PATH: export PATH=\"$INSTALL_DIR:\$PATH\""

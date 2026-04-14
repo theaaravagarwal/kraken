@@ -11,7 +11,7 @@ Makefiles are great for complex build pipelines, but overkill when you just want
 ### Install
 
 ```bash
-# One-line install (requires Go)
+# One-line install (downloads latest GitHub Release)
 curl -sSL https://raw.githubusercontent.com/theaaravagarwal/kraken/main/install.sh | bash
 ```
 
@@ -21,11 +21,26 @@ curl -sSL https://raw.githubusercontent.com/theaaravagarwal/kraken/main/install.
 # Initialize default config
 kraken --init
 
-# Compile a file
+# Compile and run a file (smart root mode)
 kraken main.cpp
 
 # Compile and run immediately
-kraken --run main.go
+kraken run main.go
+
+# Compile and run without leaving a binary behind
+kraken run --temp main.cpp
+
+# Watch/rebuild/restart on save
+kraken watch main.cpp
+
+# Parallel judge from tests/*.in + tests/*.out
+kraken test solution.cpp tests
+
+# Flag-first run form (also supported)
+kraken run --debug main.cpp
+
+# Print exact executed compiler command
+kraken --verbose run main.cpp
 
 # Check environment health
 kraken --doctor
@@ -36,21 +51,26 @@ kraken --doctor
 ```bash
 git clone https://github.com/theaaravagarwal/kraken.git
 cd kraken
-go install .
+./build.sh
 ```
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `kraken <file>` | Compile a file using the appropriate compiler |
+| `kraken <file>` | Compile and run a file using the appropriate compiler |
 | `kraken <file> --debug` | Compile and pass extra flags to the compiler |
-| `kraken --run <file>` | Compile and run the output immediately |
-| `kraken --list` | Show available compilers and their status |
-| `kraken --init` | Generate the default config file |
-| `kraken --doctor` | Check environment health (compilers, config, permissions) |
-| `kraken --version` | Show version info |
-| `kraken --help` | Show help text |
+| `kraken run <file>` | Compile and run the output immediately |
+| `kraken run --temp <file>` | Compile/run in a temp dir and clean up automatically |
+| `kraken watch <file>` | Debounced watch mode with process-group restart |
+| `kraken test <file> [tests-dir]` | Parallel testcase runner with normalized diff |
+| `kraken run --debug <file>` | Compile and run with flag-first extra args |
+| `kraken --verbose run <file>` | Print executed compiler command (`[EXEC]: ...`) |
+| `kraken list` | Show available compilers and their status |
+| `kraken init` | Generate the default config file |
+| `kraken doctor` | Check environment health (compilers, config, permissions) |
+| `kraken version` | Show version info |
+| `kraken help` | Show help text |
 
 ## Configuration
 
@@ -86,8 +106,8 @@ languages:
 The `doctor` command diagnoses your setup:
 
 1. **Compilers in PATH** — verifies each configured compiler binary exists and is executable.
-2. **Config health** — checks the YAML file is valid and readable.
-3. **Permissions** — confirms kraken can write to `~/.config/kraken/`.
+2. **Required toolchains** — checks `g++`, `clang`, and `go` are installed.
+3. **Config health** — checks the YAML file is valid and readable.
 
 ## Versioning
 
